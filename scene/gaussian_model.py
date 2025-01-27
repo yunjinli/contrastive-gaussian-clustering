@@ -163,12 +163,12 @@ class GaussianModel:
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
 
         l = [
-            {'params': [self._xyz], 'lr': training_args.position_lr_init * self.spatial_lr_scale, "name": "xyz"},
-            {'params': [self._features_dc], 'lr': training_args.feature_lr, "name": "f_dc"},
-            {'params': [self._features_rest], 'lr': training_args.feature_lr / 20.0, "name": "f_rest"},
-            {'params': [self._opacity], 'lr': training_args.opacity_lr, "name": "opacity"},
-            {'params': [self._scaling], 'lr': training_args.scaling_lr, "name": "scaling"},
-            {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"},
+            # {'params': [self._xyz], 'lr': training_args.position_lr_init * self.spatial_lr_scale, "name": "xyz"},
+            # {'params': [self._features_dc], 'lr': training_args.feature_lr, "name": "f_dc"},
+            # {'params': [self._features_rest], 'lr': training_args.feature_lr / 20.0, "name": "f_rest"},
+            # {'params': [self._opacity], 'lr': training_args.opacity_lr, "name": "opacity"},
+            # {'params': [self._scaling], 'lr': training_args.scaling_lr, "name": "scaling"},
+            # {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"},
             {'params': [self._seg_features], 'lr':training_args.feature_lr, "name": "f_seg"}
         ]
 
@@ -263,8 +263,11 @@ class GaussianModel:
         
         seg_features = np.zeros((xyz.shape[0], self.seg_features_dim, 1))
         for idx in range(self.seg_features_dim):
-            seg_features[:, idx, 0] = np.asarray(plydata.elements[0]["f_seg_"+str(idx)])
-
+            try:
+                seg_features[:, idx, 0] = np.asarray(plydata.elements[0]["f_seg_"+str(idx)])
+            except:
+                print(f"[WARNING] Failed to load segfeats. Assigning random values...")
+                seg_features[:, idx, 0] = np.random.randn(seg_features.shape[0])
         self._xyz = nn.Parameter(torch.tensor(xyz, dtype=torch.float, device="cuda").requires_grad_(True))
         self._features_dc = nn.Parameter(torch.tensor(features_dc, dtype=torch.float, device="cuda").transpose(1, 2).contiguous().requires_grad_(True))
         self._features_rest = nn.Parameter(torch.tensor(features_extra, dtype=torch.float, device="cuda").transpose(1, 2).contiguous().requires_grad_(True))

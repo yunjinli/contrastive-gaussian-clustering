@@ -15,7 +15,10 @@ from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianR
 from scene.gaussian_model import GaussianModel
 from utils.sh_utils import eval_sh
 
-def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None):
+def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
+           d_xyz=0.0, d_scaling=0.0, d_rotation=0.0,
+           scaling_modifier = 1.0, override_color = None, indices=None
+           ):
     """
     Render the scene. 
     
@@ -50,7 +53,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
 
     rasterizer = GaussianRasterizer(raster_settings=raster_settings)
 
-    means3D = pc.get_xyz
+    means3D = pc.get_xyz + d_xyz
     means2D = screenspace_points
     opacity = pc.get_opacity
 
@@ -62,8 +65,8 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     if pipe.compute_cov3D_python:
         cov3D_precomp = pc.get_covariance(scaling_modifier)
     else:
-        scales = pc.get_scaling
-        rotations = pc.get_rotation
+        scales = pc.get_scaling + d_scaling
+        rotations = pc.get_rotation + d_rotation
 
     # If precomputed colors are provided, use them. Otherwise, if it is desired to precompute colors
     # from SHs in Python, do it. If not, then SH -> RGB conversion will be done by rasterizer.
@@ -81,7 +84,22 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             shs_features = pc.get_seg_features
     else:
         colors_precomp = override_color
+        shs_features = pc.get_seg_features
 
+
+    if indices is not None:
+        means3D = means3D[indices]
+        means2D = means2D[indices]
+        opacity = opacity[indices]
+        if colors_precomp is not None:
+            colors_precomp = colors_precomp[indices]
+        else:
+            shs = shs[indices]
+        shs_features = shs_features[indices]
+        scales = scales[indices]
+        rotations = rotations[indices]
+        if cov3D_precomp is not None:
+            cov3D_precomp = cov3D_precomp[indices]
     # Rasterize visible Gaussians to image, obtain their radii (on screen). 
     rendered_image, radii, rendered_features = rasterizer(
         means3D = means3D,

@@ -13,7 +13,8 @@ from scene.cameras import Camera
 import numpy as np
 from utils.general_utils import PILtoTorch
 from utils.graphics_utils import fov2focal
-
+import json
+import torch
 WARNED = False
 
 def loadCam(args, id, cam_info, resolution_scale):
@@ -46,13 +47,17 @@ def loadCam(args, id, cam_info, resolution_scale):
     if resized_image_rgb.shape[1] == 4:
         loaded_mask = resized_image_rgb[3:4, ...]
     
-    segmasks = np.array(cam_info.segmasks)
+    masks = torch.from_numpy(np.array(cam_info.masks))
 
     return Camera(colmap_id=cam_info.uid, R=cam_info.R, T=cam_info.T, 
                   FoVx=cam_info.FovX, FoVy=cam_info.FovY, 
                   image=gt_image, gt_alpha_mask=loaded_mask,
-                  image_name=cam_info.image_name, uid=id, 
-                  segmasks=segmasks, data_device=args.data_device)
+                  image_name=cam_info.image_name, uid=id, data_device=args.data_device if not args.load2gpu_on_the_fly else 'cpu', fid=cam_info.fid,
+                  image_path=cam_info.image_path,
+                  image_width=cam_info.width,
+                  image_height=cam_info.height,
+                  masks=masks,
+                  mask_path=cam_info.mask_path,)
 
 def cameraList_from_camInfos(cam_infos, resolution_scale, args):
     camera_list = []
@@ -83,3 +88,25 @@ def camera_to_JSON(id, camera : Camera):
         'fx' : fov2focal(camera.FovX, camera.width)
     }
     return camera_entry
+
+def camera_nerfies_from_JSON(path, scale):
+    """Loads a JSON camera into memory."""
+    with open(path, 'r') as fp:
+        camera_json = json.load(fp)
+
+    # Fix old camera JSON.
+    if 'tangential' in camera_json:
+        camera_json['tangential_distortion'] = camera_json['tangential']
+
+    return dict(
+        orientation=np.array(camera_json['orientation']),
+        position=np.array(camera_json['position']),
+        focal_length=camera_json['focal_length'] * scale,
+        principal_point=np.array(camera_json['principal_point']) * scale,
+        skew=camera_json['skew'],
+        pixel_aspect_ratio=camera_json['pixel_aspect_ratio'],
+        radial_distortion=np.array(camera_json['radial_distortion']),
+        tangential_distortion=np.array(camera_json['tangential_distortion']),
+        image_size=np.array((int(round(camera_json['image_size'][0] * scale)),
+                             int(round(camera_json['image_size'][1] * scale)))),
+    )

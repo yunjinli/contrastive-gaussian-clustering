@@ -15,7 +15,7 @@ from random import randint
 from utils.loss_utils import l1_loss, ssim, contrastive_2d_loss, spatial_loss
 from gaussian_renderer import render, network_gui
 import sys
-from scene import Scene, GaussianModel
+from scene import Scene, GaussianModel, DeformModel
 from utils.general_utils import safe_state, get_unique_id_list
 import uuid
 from tqdm import tqdm
@@ -28,12 +28,16 @@ try:
 except ImportError:
     TENSORBOARD_FOUND = False
 
-def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
-    first_iter = 0
+def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, load_iteration):
+    first_iter = load_iteration
     tb_writer = prepare_output_and_logger(dataset)
-    gaussians = GaussianModel(dataset.sh_degree)
-    scene = Scene(dataset, gaussians)
+    gaussians = GaussianModel(dataset.sh_degree,)
+    scene = Scene(dataset, gaussians, load_iteration=load_iteration)
     gaussians.training_setup(opt)
+    ## Deformation model
+    deform = DeformModel()
+    deform.load_weights(dataset.model_path, iteration=load_iteration)
+    # deform.train_setting(opt)
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)
         gaussians.restore(model_params, opt)
@@ -83,19 +87,26 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         bg = torch.rand((3), device="cuda") if opt.random_background else background
 
-        render_pkg = render(viewpoint_cam, gaussians, pipe, bg)
+        fid = viewpoint_cam.fid
+        N = gaussians.get_xyz.shape[0]
+        time_input = fid.unsqueeze(0).expand(N, -1)
+        
+        d_xyz, d_rotation, d_scaling = deform.step(gaussians.get_xyz.detach(), time_input)
+
+        render_pkg = render(viewpoint_cam, gaussians, pipe, bg, d_xyz=d_xyz, d_rotation=d_rotation, d_scaling=d_scaling)
         image, viewspace_point_tensor, visibility_filter, radii, feature_map = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"], render_pkg["render_feature_map"]
 
         # Loss
-        gt_image = viewpoint_cam.original_image.cuda()
-        Ll1 = l1_loss(image, gt_image)
-        loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
-        
+        # gt_image = viewpoint_cam.original_image.cuda()
+        # Ll1 = l1_loss(image, gt_image)
+        # loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
+        Ll1 = None
+        loss = 0.0
         # Clustering Loss
         if iteration % opt.contrastive_interval == 0:
             feature_map = feature_map.permute(1, 2, 0)
             feature_map = feature_map / (feature_map.norm(dim=-1, keepdim=True) + 1e-9)
-            gt_segmasks = viewpoint_cam.segmasks.cuda().long()
+            gt_segmasks = viewpoint_cam.masks.cuda().long()
             id_unique_list, n_i_list = get_unique_id_list(gt_segmasks, opt.min_pixnum)
             loss_obj = contrastive_2d_loss(gt_segmasks, feature_map, id_unique_list, n_i_list, dim_features=gaussians.seg_features_dim, lambda_val=opt.contrastive_lambda)
             loss += loss_obj
@@ -120,7 +131,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 progress_bar.close()
 
             # Log and save
-            training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background))
+            training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background), deform)
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
@@ -169,9 +180,10 @@ def prepare_output_and_logger(args):
         print("Tensorboard not available: not logging progress")
     return tb_writer
 
-def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs):
+def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, deform):
     if tb_writer:
-        tb_writer.add_scalar('train_loss_patches/l1_loss', Ll1.item(), iteration)
+        if Ll1:
+            tb_writer.add_scalar('train_loss_patches/l1_loss', Ll1.item(), iteration)
         tb_writer.add_scalar('train_loss_patches/total_loss', loss.item(), iteration)
         tb_writer.add_scalar('iter_time', elapsed, iteration)
 
@@ -186,7 +198,12 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
                 l1_test = 0.0
                 psnr_test = 0.0
                 for idx, viewpoint in enumerate(config['cameras']):
-                    image = torch.clamp(renderFunc(viewpoint, scene.gaussians, *renderArgs)["render"], 0.0, 1.0)
+                    fid = viewpoint.fid
+                    xyz = scene.gaussians.get_xyz
+                    time_input = fid.unsqueeze(0).expand(xyz.shape[0], -1)
+                    d_xyz, d_rotation, d_scaling = deform.step(xyz.detach(), time_input)
+                    
+                    image = torch.clamp(renderFunc(viewpoint, scene.gaussians, *renderArgs, d_xyz, d_scaling, d_rotation)["render"], 0.0, 1.0)
                     gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
                     if tb_writer and (idx < 5):
                         tb_writer.add_images(config['name'] + "_view_{}/render".format(viewpoint.image_name), image[None], global_step=iteration)
@@ -201,9 +218,9 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
                     tb_writer.add_scalar(config['name'] + '/loss_viewpoint - l1_loss', l1_test, iteration)
                     tb_writer.add_scalar(config['name'] + '/loss_viewpoint - psnr', psnr_test, iteration)
 
-        if tb_writer:
-            tb_writer.add_histogram("scene/opacity_histogram", scene.gaussians.get_opacity, iteration)
-            tb_writer.add_scalar('total_points', scene.gaussians.get_xyz.shape[0], iteration)
+        # if tb_writer:
+        #     tb_writer.add_histogram("scene/opacity_histogram", scene.gaussians.get_opacity, iteration)
+        #     tb_writer.add_scalar('total_points', scene.gaussians.get_xyz.shape[0], iteration)
         torch.cuda.empty_cache()
 
 if __name__ == "__main__":
@@ -221,6 +238,8 @@ if __name__ == "__main__":
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default = None)
+    parser.add_argument('--load_iteration', type=int, default=-1)
+
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
     
@@ -232,7 +251,7 @@ if __name__ == "__main__":
     # Start GUI server, configure and run training
     network_gui.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
-    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from)
+    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, args.load_iteration)
 
     # All done
     print("\nTraining complete.")
